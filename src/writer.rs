@@ -48,7 +48,7 @@ use events::Event;
 ///         Ok(e) => assert!(writer.write_event(&e).is_ok()),
 ///         Err(e) => panic!("{}", e),
 ///     }
-///     buf.clear();
+///     reader.try_clear_buffer(&mut buf);
 /// }
 ///
 /// let result = writer.into_inner().into_inner();

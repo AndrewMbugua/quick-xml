@@ -24,7 +24,7 @@ fn test_sample() {
             Eof => break,
             _ => (),
         }
-        buf.clear();
+        r.try_clear_buffer(&mut buf);
     }
     println!("{}", count);
 }
@@ -278,7 +278,7 @@ fn test_default_ns_shadowing_expanded() {
             e => panic!("Expected Start event (<outer>), got {:?}", e),
         }
     }
-    buf.clear();
+    r.try_clear_buffer(&mut buf);
 
     // <inner att1='a' xmlns='urn:example:i' />
     {
@@ -358,7 +358,7 @@ fn fuzz_53() {
     loop {
         match reader.read_event(&mut buf) {
             Ok(quick_xml::events::Event::Eof) | Err(..) => break,
-            _ => buf.clear(),
+            _ => { reader.try_clear_buffer(&mut buf); },
         }
     }
 }
@@ -374,9 +374,9 @@ fn test_issue94() {
     loop {
         match reader.read_event(&mut buf) {
             Ok(quick_xml::events::Event::Eof) | Err(..) => break,
-            _ => buf.clear(),
+            _ => { reader.try_clear_buffer(&mut buf); },
         }
-        buf.clear();
+        reader.try_clear_buffer(&mut buf);
     }
 }
 
@@ -408,7 +408,7 @@ fn fuzz_101() {
             Ok(Eof) | Err(..) => break,
             _ => (),
         }
-        buf.clear();
+        reader.try_clear_buffer(&mut buf);
     }
 }
 

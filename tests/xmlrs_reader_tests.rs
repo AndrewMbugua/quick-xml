@@ -107,24 +107,6 @@ fn sample_ns_short() {
 }
 
 #[test]
-fn eof_1() {
-    test(
-        br#"<?xml"#,
-        br#"Error: Unexpected EOF during reading XmlDecl."#,
-        true,
-    );
-}
-
-#[test]
-fn bad_1() {
-    test(
-        br#"<?xml&.,"#,
-        br#"1:6 Error: Unexpected EOF during reading XmlDecl."#,
-        true,
-    );
-}
-
-#[test]
 fn dashes_in_comments() {
     test(
         br#"<!-- comment -- --><hello/>"#,
@@ -314,7 +296,7 @@ fn test(input: &[u8], output: &[u8], is_short: bool) {
     }
 
     loop {
-        buf.clear();
+        reader.try_clear_buffer(&mut buf);
         let event = reader.read_namespaced_event(&mut buf, &mut ns_buffer);
         let line = xmlrs_display(&event);
         if let Some((n, spec)) = spec_lines.next() {
@@ -340,8 +322,9 @@ fn test(input: &[u8], output: &[u8], is_short: bool) {
         }
 
         if !is_short && line.starts_with("StartDocument") {
+            reader.try_clear_buffer(&mut buf);
             // advance next Characters(empty space) ...
-            if let Ok(Event::Text(ref e)) = reader.read_event(&mut Vec::new()) {
+            if let Ok(Event::Text(ref e)) = reader.read_event(&mut buf) {
                 if e.iter().any(|b| match *b {
                     b' ' | b'\r' | b'\n' | b'\t' => false,
                     _ => true,

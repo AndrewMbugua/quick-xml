@@ -8,9 +8,8 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::{Reader, Result, Writer};
 
 macro_rules! next_eq_name {
-    ($r:expr, $t:tt, $bytes:expr) => {
-        let mut buf = Vec::new();
-        match $r.read_event(&mut buf).unwrap() {
+    ($r:expr, $t:tt, $bytes:expr, $buf:expr) => {
+        match $r.read_event(&mut $buf).unwrap() {
             $t(ref e) if e.name() == $bytes => (),
             e => panic!(
                 "expecting {}({:?}), found {:?}",
@@ -19,14 +18,12 @@ macro_rules! next_eq_name {
                 e
             ),
         }
-        buf.clear();
     };
 }
 
 macro_rules! next_eq_content {
-    ($r:expr, $t:tt, $bytes:expr) => {
-        let mut buf = Vec::new();
-        match $r.read_event(&mut buf).unwrap() {
+    ($r:expr, $t:tt, $bytes:expr, $buf:expr) => {
+        match $r.read_event(&mut $buf).unwrap() {
             $t(ref e) if &**e == $bytes => (),
             e => panic!(
                 "expecting {}({:?}), found {:?}",
@@ -35,91 +32,195 @@ macro_rules! next_eq_content {
                 e
             ),
         }
-        buf.clear();
+    };
+}
+
+macro_rules! next_eq_eof {
+    ($r:expr, $buf:expr) => {
+        match $r.read_event(&mut $buf).unwrap() {
+            Eof => (),
+            e => panic!(
+                "expecting {}, found {:?}",
+                stringify!($t),
+                e
+            ),
+        }
     };
 }
 
 macro_rules! next_eq {
-    ($r:expr, Start, $bytes:expr) => (next_eq_name!($r, Start, $bytes););
-    ($r:expr, End, $bytes:expr) => (next_eq_name!($r, End, $bytes););
-    ($r:expr, Empty, $bytes:expr) => (next_eq_name!($r, Empty, $bytes););
-    ($r:expr, Comment, $bytes:expr) => (next_eq_content!($r, Comment, $bytes););
-    ($r:expr, Text, $bytes:expr) => (next_eq_content!($r, Text, $bytes););
-    ($r:expr, CData, $bytes:expr) => (next_eq_content!($r, CData, $bytes););
-    ($r:expr, $t0:tt, $b0:expr, $($t:tt, $bytes:expr),*) => {
-        next_eq!($r, $t0, $b0);
-        next_eq!($r, $($t, $bytes),*);
+    ($r:expr, $buf:expr, Start, $bytes:expr) => (next_eq_name!($r, Start, $bytes, $buf););
+    ($r:expr, $buf:expr, End, $bytes:expr) => (next_eq_name!($r, End, $bytes, $buf););
+    ($r:expr, $buf:expr, Empty, $bytes:expr) => (next_eq_name!($r, Empty, $bytes, $buf););
+    ($r:expr, $buf:expr, Comment, $bytes:expr) => (next_eq_content!($r, Comment, $bytes, $buf););
+    ($r:expr, $buf:expr, Text, $bytes:expr) => (next_eq_content!($r, Text, $bytes, $buf););
+    ($r:expr, $buf:expr, CData, $bytes:expr) => (next_eq_content!($r, CData, $bytes, $buf););
+    ($r:expr, $buf:expr, Eof) => (next_eq_eof!($r, $buf););
+    ($r:expr, $buf:expr, $t0:tt, $b0:expr, $($t:tt, $bytes:expr),*) => {
+        next_eq!($r, $buf, $t0, $b0);
+        next_eq!($r, $buf, $($t, $bytes),*);
     };
+}
+
+use std::io::{ self, Read };
+
+pub struct TestReader {
+    sources: Vec<Vec<u8>>,
+}
+
+impl TestReader {
+    fn new(sources:  Vec<Vec<u8>>) -> TestReader {
+        TestReader { sources }
+    }
+}
+
+impl Read for TestReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.sources.len() == 0 {
+            return Ok(0);
+        }
+        let source = &mut self.sources[0];
+        let copied_len = if buf.len() >= source.len() {
+            source.len()
+        } else {
+            buf.len()
+        };
+        source.drain(0..copied_len).enumerate().for_each(|(idx, x)| {
+            buf[idx] = x;
+        });
+        if source.len() == 0 {
+            self.sources.remove(0);
+        }
+        Ok(copied_len)
+    }
 }
 
 #[test]
 fn test_start() {
     let mut r = Reader::from_str("<a>");
     r.trim_text(true);
-    next_eq!(r, Start, b"a");
+    next_eq!(r, vec![], Start, b"a");
+}
+
+use std::io::BufReader;
+
+#[test]
+fn test_start_single_iter() {
+    let mut buf = Vec::new();
+    let sources : Vec<Vec<u8>> = vec![
+        b"<SomeElement>".to_vec(),
+    ];
+    let test_reader = TestReader::new(sources);
+    let mut r = Reader::from_reader(BufReader::new(test_reader));
+    r.trim_text(true);
+    next_eq!(r, &mut buf, Start, b"SomeElement");
+    assert_eq!(r.buffer_position(), 13);
+}
+
+#[test]
+fn test_start_multiple_iter_no_eof() {
+    let mut buf = Vec::new();
+    let sources : Vec<Vec<u8>> = vec![
+        b"<SomeEle".to_vec(),
+        b"ment>".to_vec(),
+    ];
+    let test_reader = TestReader::new(sources);
+    let mut r = Reader::from_reader(BufReader::new(test_reader));
+    r.trim_text(true);
+    next_eq!(r, &mut buf, Start, b"SomeElement");
+    assert_eq!(r.buffer_position(), 13);
+}
+
+#[test]
+fn test_start_multiple_iter_eof() {
+    let mut buf = Vec::new();
+    let sources : Vec<Vec<u8>> = vec![
+        b"<SomeEle".to_vec(),
+        b"".to_vec(),
+        b"".to_vec(),
+        b"".to_vec(),
+        b"ment>".to_vec(),
+    ];
+    let test_reader = TestReader::new(sources);
+    let mut r = Reader::from_reader(BufReader::new(test_reader));
+    r.trim_text(true);
+    next_eq!(r, &mut buf, Eof);
+    next_eq!(r, &mut buf, Eof);
+    next_eq!(r, &mut buf, Eof);
+    next_eq!(r, &mut buf, Start, b"SomeElement");
+    assert_eq!(r.buffer_position(), 13);
 }
 
 #[test]
 fn test_start_end() {
+    let mut buf = vec![];
     let mut r = Reader::from_str("<a></a>");
     r.trim_text(true);
-    next_eq!(r, Start, b"a", End, b"a");
+    next_eq!(r, &mut buf, Start, b"a", End, b"a");
 }
 
 #[test]
 fn test_start_end_with_ws() {
+    let mut buf = vec![];
     let mut r = Reader::from_str("<a></a >");
     r.trim_text(true);
-    next_eq!(r, Start, b"a", End, b"a");
+    next_eq!(r, &mut buf, Start, b"a", End, b"a");
 }
 
 #[test]
 fn test_start_end_attr() {
+    let mut buf = vec![];
     let mut r = Reader::from_str("<a b=\"test\"></a>");
     r.trim_text(true);
-    next_eq!(r, Start, b"a", End, b"a");
+    next_eq!(r, &mut buf, Start, b"a", End, b"a");
 }
 
 #[test]
 fn test_empty() {
+    let mut buf = vec![];
     let mut r = Reader::from_str("<a />");
     r.trim_text(true).expand_empty_elements(false);
-    next_eq!(r, Empty, b"a");
+    next_eq!(r, &mut buf, Empty, b"a");
 }
 
 #[test]
 fn test_empty_can_be_expanded() {
+    let mut buf = vec![];
     let mut r = Reader::from_str("<a />");
     r.trim_text(true).expand_empty_elements(true);
-    next_eq!(r, Start, b"a", End, b"a");
+    next_eq!(r, &mut buf, Start, b"a", End, b"a");
 }
 
 #[test]
 fn test_empty_attr() {
+    let mut buf = vec![];
     let mut r = Reader::from_str("<a b=\"test\" />");
     r.trim_text(true).expand_empty_elements(false);
-    next_eq!(r, Empty, b"a");
+    next_eq!(r, &mut buf, Empty, b"a");
 }
 
 #[test]
 fn test_start_end_comment() {
+    let mut buf = vec![];
     let mut r = Reader::from_str("<b><a b=\"test\" c=\"test\"/> <a  /><!--t--></b>");
     r.trim_text(true).expand_empty_elements(false);
-    next_eq!(r, Start, b"b", Empty, b"a", Empty, b"a", Comment, b"t", End, b"b");
+    next_eq!(r, &mut buf, Start, b"b", Empty, b"a", Empty, b"a", Comment, b"t", End, b"b");
 }
 
 #[test]
 fn test_start_txt_end() {
+    let mut buf = vec![];
     let mut r = Reader::from_str("<a>test</a>");
     r.trim_text(true);
-    next_eq!(r, Start, b"a", Text, b"test", End, b"a");
+    next_eq!(r, &mut buf, Start, b"a", Text, b"test", End, b"a");
 }
 
 #[test]
 fn test_comment() {
+    let mut buf = vec![];
     let mut r = Reader::from_str("<!--test-->");
     r.trim_text(true);
-    next_eq!(r, Comment, b"test");
+    next_eq!(r, &mut buf, Comment, b"test");
 }
 
 #[test]
@@ -159,45 +260,51 @@ fn test_xml_decl() {
 
 #[test]
 fn test_trim_test() {
+    let mut buf = vec![];
     let txt = "<a><b>  </b></a>";
     let mut r = Reader::from_str(txt);
     r.trim_text(true);
-    next_eq!(r, Start, b"a", Start, b"b", End, b"b", End, b"a");
+    next_eq!(r, &mut buf, Start, b"a", Start, b"b", End, b"b", End, b"a");
 
+    let mut buf = vec![];
     let mut r = Reader::from_str(txt);
     r.trim_text(false);
     next_eq!(
-        r, Text, b"", Start, b"a", Text, b"", Start, b"b", Text, b"  ", End, b"b", Text, b"", End,
+        r, &mut buf, Text, b"", Start, b"a", Text, b"", Start, b"b", Text, b"  ", End, b"b", Text, b"", End,
         b"a"
     );
 }
 
 #[test]
 fn test_cdata() {
+    let mut buf = vec![];
     let mut r = Reader::from_str("<![CDATA[test]]>");
     r.trim_text(true);
-    next_eq!(r, CData, b"test");
+    next_eq!(r, &mut buf, CData, b"test");
 }
 
 #[test]
 fn test_cdata_open_close() {
+    let mut buf = vec![];
     let mut r = Reader::from_str("<![CDATA[test <> test]]>");
     r.trim_text(true);
-    next_eq!(r, CData, b"test &lt;&gt; test");
+    next_eq!(r, &mut buf, CData, b"test &lt;&gt; test");
 }
 
 #[test]
 fn test_start_attr() {
+    let mut buf = vec![];
     let mut r = Reader::from_str("<a b=\"c\">");
     r.trim_text(true);
-    next_eq!(r, Start, b"a");
+    next_eq!(r, &mut buf, Start, b"a");
 }
 
 #[test]
 fn test_nested() {
+    let mut buf = Vec::new();
     let mut r = Reader::from_str("<a><b>test</b><c/></a>");
     r.trim_text(true).expand_empty_elements(false);
-    next_eq!(r, Start, b"a", Start, b"b", Text, b"test", End, b"b", Empty, b"c", End, b"a");
+    next_eq!(r, &mut buf, Start, b"a", Start, b"b", Text, b"test", End, b"b", Empty, b"c", End, b"a");
 }
 
 #[test]
@@ -211,7 +318,7 @@ fn test_writer() {
         match reader.read_event(&mut buf) {
             Ok(Eof) => break,
             Ok(e) => assert!(writer.write_event(e).is_ok()),
-            Err(e) => panic!(e),
+            Err(e) => panic!("{}", e),
         }
     }
 
@@ -230,7 +337,7 @@ fn test_writer_borrow() {
         match reader.read_event(&mut buf) {
             Ok(Eof) => break,
             Ok(e) => assert!(writer.write_event(&e).is_ok()), // either `e` or `&e`
-            Err(e) => panic!(e),
+            Err(e) => panic!("{}", e),
         }
     }
 
@@ -249,7 +356,7 @@ fn test_writer_indent() {
         match reader.read_event(&mut buf) {
             Ok(Eof) => break,
             Ok(e) => assert!(writer.write_event(e).is_ok()),
-            Err(e) => panic!(e),
+            Err(e) => panic!("{}", e),
         }
     }
 
@@ -274,7 +381,7 @@ fn test_writer_indent_cdata() {
         match reader.read_event(&mut buf) {
             Ok(Eof) => break,
             Ok(e) => assert!(writer.write_event(e).is_ok()),
-            Err(e) => panic!(e),
+            Err(e) => panic!("{}", e),
         }
     }
 
@@ -299,7 +406,7 @@ fn test_write_empty_element_attrs() {
         match reader.read_event(&mut buf) {
             Ok(Eof) => break,
             Ok(e) => assert!(writer.write_event(e).is_ok()),
-            Err(e) => panic!(e),
+            Err(e) => panic!("{}", e),
         }
     }
 
@@ -328,7 +435,7 @@ fn test_write_attrs() {
             }
             Ok(End(_)) => End(BytesEnd::borrowed(b"copy")),
             Ok(e) => e,
-            Err(e) => panic!(e),
+            Err(e) => panic!("{}", e),
         };
         assert!(writer.write_event(event).is_ok());
     }
@@ -433,17 +540,16 @@ fn test_buf_position_err_end_element() {
 }
 
 #[test]
-fn test_buf_position_err_comment() {
+fn test_buf_position_eof_comment() {
     let mut r = Reader::from_str("<a><!--b>");
     r.trim_text(true).check_end_names(true);
 
-    next_eq!(r, Start, b"a");
+    next_eq!(r, vec![], Start, b"a");
     assert_eq!(r.buffer_position(), 3);
 
     let mut buf = Vec::new();
     match r.read_event(&mut buf) {
-        Err(_) if r.buffer_position() == 4 => {
-            // error at char 5: no closing --> tag found
+        Ok(Eof) => {
             assert!(true);
         }
         Err(e) => panic!(
@@ -466,6 +572,9 @@ fn test_buf_position_err_comment_2_buf() {
 
     let mut buf = Vec::new();
     match r.read_event(&mut buf) {
+        Ok(Eof) => {
+            assert!(true);
+        }
         Err(_) if r.buffer_position() == 4 => {
             // error at char 5: no closing --> tag found
             assert!(true);
@@ -480,17 +589,16 @@ fn test_buf_position_err_comment_2_buf() {
 }
 
 #[test]
-fn test_buf_position_err_comment_trim_text() {
+fn test_buf_position_eof_comment_trim_text() {
     let mut r = Reader::from_str("<a>\r\n <!--b>");
     r.trim_text(true).check_end_names(true);
 
-    next_eq!(r, Start, b"a");
+    next_eq!(r, vec![], Start, b"a");
     assert_eq!(r.buffer_position(), 3);
 
     let mut buf = Vec::new();
     match r.read_event(&mut buf) {
-        Err(_) if r.buffer_position() == 7 => {
-            // error at char 5: no closing --> tag found
+        Ok(Eof) => {
             assert!(true);
         }
         Err(e) => panic!(
@@ -498,7 +606,7 @@ fn test_buf_position_err_comment_trim_text() {
             r.buffer_position(),
             e
         ),
-        e => assert!(false, "expecting error, found {:?}", e),
+        e => assert!(false, "expecting Ok(Eof), found {:?}", e),
     }
 }
 
@@ -609,14 +717,17 @@ fn test_default_namespace_reset() {
 fn test_escaped_content() {
     let mut r = Reader::from_str("<a>&lt;test&gt;</a>");
     r.trim_text(true);
-    next_eq!(r, Start, b"a");
     let mut buf = Vec::new();
+    next_eq!(r, buf, Start, b"a");
+    r.try_clear_buffer(&mut buf);
     match r.read_event(&mut buf) {
         Ok(Text(e)) => {
             if &*e != b"&lt;test&gt;" {
                 panic!(
-                    "content unexpected: expecting '&lt;test&gt;', got '{:?}'",
-                    from_utf8(&*e)
+                    "content unexpected: expecting '&lt;test&gt;', got '{:?}' {} {}",
+                    from_utf8(&*e).unwrap(),
+                    e.len(),
+                    b"&lt;test&gt;".len()
                 );
             }
             match e.unescaped() {
@@ -642,7 +753,8 @@ fn test_escaped_content() {
             e
         ),
     }
-    next_eq!(r, End, b"a");
+    r.try_clear_buffer(&mut buf);
+    next_eq!(r, buf, End, b"a");
 }
 
 #[test]
@@ -664,8 +776,19 @@ fn test_read_write_roundtrip_results_in_identity() {
         match reader.read_event(&mut buf) {
             Ok(Eof) => break,
             Ok(e) => assert!(writer.write_event(e).is_ok()),
-            Err(e) => panic!(e),
+            Err(e) => panic!("{}", e),
         }
+    }
+    match reader.read_remaining_text(&mut buf) {
+        Ok(Eof) => {},
+        Ok(e) => {
+            if let Event::Text(_) = e {
+                assert!(writer.write_event(e).is_ok());
+            } else {
+                panic!("Expected Text, found: {:?}", e);
+            }
+        }
+        Err(e) => panic!("{}", e),
     }
 
     let result = writer.into_inner().into_inner();
@@ -688,12 +811,25 @@ fn test_read_write_roundtrip() {
     let mut writer = Writer::new(Cursor::new(Vec::new()));
     let mut buf = Vec::new();
     loop {
-        match reader.read_event(&mut buf) {
+        let evt = reader.read_event(&mut buf);
+        match evt {
             Ok(Eof) => break,
             Ok(e) => assert!(writer.write_event(e).is_ok()),
-            Err(e) => panic!(e),
+            Err(e) => panic!("{}", e),
         }
     }
+    match reader.read_remaining_text(&mut buf) {
+        Ok(Eof) => {},
+        Ok(e) => {
+            if let Event::Text(_) = e {
+                assert!(writer.write_event(e).is_ok());
+            } else {
+                panic!("Expected Text, found: {:?}", e);
+            }
+        }
+        Err(e) => panic!("{}", e),
+    }
+
 
     let result = writer.into_inner().into_inner();
     assert_eq!(String::from_utf8(result).unwrap(), input.to_string());
@@ -724,9 +860,21 @@ fn test_read_write_roundtrip_escape() {
                     .is_ok());
             }
             Ok(e) => assert!(writer.write_event(e).is_ok()),
-            Err(e) => panic!(e),
+            Err(e) => panic!("{}", e),
         }
     }
+    match reader.read_remaining_text(&mut buf) {
+        Ok(Eof) => {},
+        Ok(e) => {
+            if let Event::Text(_) = e {
+                assert!(writer.write_event(e).is_ok());
+            } else {
+                panic!("Expected Text, found: {:?}", e);
+            }
+        }
+        Err(e) => panic!("{}", e),
+    }
+
 
     let result = writer.into_inner().into_inner();
     assert_eq!(String::from_utf8(result).unwrap(), input.to_string());
@@ -757,9 +905,21 @@ fn test_read_write_roundtrip_escape_text() {
                     .is_ok());
             }
             Ok(e) => assert!(writer.write_event(e).is_ok()),
-            Err(e) => panic!(e),
+            Err(e) => panic!("{}", e),
         }
     }
+    match reader.read_remaining_text(&mut buf) {
+        Ok(Eof) => {},
+        Ok(e) => {
+            if let Event::Text(_) = e {
+                assert!(writer.write_event(e).is_ok());
+            } else {
+                panic!("Expected Text, found: {:?}", e);
+            }
+        }
+        Err(e) => panic!("{}", e),
+    }
+
 
     let result = writer.into_inner().into_inner();
     assert_eq!(String::from_utf8(result).unwrap(), input.to_string());
@@ -785,7 +945,7 @@ fn test_closing_bracket_in_single_quote_attr() {
         }
         x => panic!("expected <a attr='>'>, got {:?}", x),
     }
-    next_eq!(r, End, b"a");
+    next_eq!(r, vec![], End, b"a");
 }
 
 #[test]
@@ -808,7 +968,7 @@ fn test_closing_bracket_in_double_quote_attr() {
         }
         x => panic!("expected <a attr='>'>, got {:?}", x),
     }
-    next_eq!(r, End, b"a");
+    next_eq!(r, vec![], End, b"a");
 }
 
 #[test]
@@ -831,7 +991,7 @@ fn test_closing_bracket_in_double_quote_mixed() {
         }
         x => panic!("expected <a attr='>'>, got {:?}", x),
     }
-    next_eq!(r, End, b"a");
+    next_eq!(r, vec![], End, b"a");
 }
 
 #[test]
@@ -854,7 +1014,7 @@ fn test_closing_bracket_in_single_quote_mixed() {
         }
         x => panic!("expected <a attr='>'>, got {:?}", x),
     }
-    next_eq!(r, End, b"a");
+    next_eq!(r, vec![], End, b"a");
 }
 
 #[test]

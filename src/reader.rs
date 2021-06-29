@@ -17,11 +17,39 @@ use memchr;
 
 #[derive(Clone)]
 enum TagState {
-    Opened,
-    Closed,
+    /// Nothing has been parsed yet.
+    Beginning,
+
+    /// An empty (self-closing) tag has been encountered and the current
+    /// configuration asks us to expand them (send two events: an opening and a
+    /// closing one, instead of a single one: an `Empty` event)
     Empty,
-    /// Either Eof or Errored
+
+    /// Errored
     Exit,
+
+    /// A closing tag ">" has been encountered.
+    /// `offset` is the offset of the closing tag in the linked buffer.
+    ClosingTagEncountered { offset: usize },
+
+    /// An Opening tag "<" has been encountered.
+    /// `offset` is the offset of the opening tag in the linked buffer.
+    OpeningTagEncountered {
+        offset: usize,
+        reading_state: State,
+    },
+
+    /// We're currently inside a comment.
+    /// `offset` is the offset of the opening tag in the linked buffer.
+    InsideComment { offset: usize },
+
+    /// We're currently inside a CDATA section.
+    /// `offset` is the offset of the opening tag in the linked buffer.
+    InsideCdata { offset: usize },
+
+    /// We're currently inside a Document Type Definition.
+    /// `offset` is the offset of the opening tag in the linked buffer.
+    InsideDocType { offset: usize },
 }
 
 /// A low level encoding-agnostic XML event reader.
@@ -68,8 +96,8 @@ pub struct Reader<B: BufRead> {
     reader: B,
     /// current buffer position, useful for debuging errors
     buf_position: usize,
-    /// current state Open/Close
-    tag_state: TagState,
+    /// Last "state" milestone encountered.
+    last_tag_state: TagState,
     /// expand empty element into an opening and closing element
     expand_empty_elements: bool,
     /// trims leading whitespace in Text events, skip the element if text is empty
@@ -104,7 +132,7 @@ impl<B: BufRead> Reader<B> {
             reader,
             opened_buffer: Vec::new(),
             opened_starts: Vec::new(),
-            tag_state: TagState::Closed,
+            last_tag_state: TagState::Beginning,
             expand_empty_elements: false,
             trim_text_start: false,
             trim_text_end: false,
@@ -211,32 +239,36 @@ impl<B: BufRead> Reader<B> {
         self
     }
 
-    /// Gets the current byte position in the input data.
+    /// Gets the currently considered position in the input data.
     ///
     /// Useful when debugging errors.
     pub fn buffer_position(&self) -> usize {
         // when internal state is Opened, we have actually read until '<',
         // which we don't want to show
-        if let TagState::Opened = self.tag_state {
-            self.buf_position - 1
-        } else {
-            self.buf_position
-        }
+        self.buf_position
     }
 
-    /// private function to read until '<' is found
-    /// return a `Text` event
-    fn read_until_open<'a, 'b>(&'a mut self, buf: &'b mut Vec<u8>) -> Result<Event<'b>> {
-        self.tag_state = TagState::Opened;
-        let buf_start = buf.len();
+    /// Private function which will read until encountering the first '<'
+    /// Returns a `Text` event if text is encountered while doing so.
+    fn read_until_opening_tag<'a, 'b>(
+        &'a mut self,
+        buf: &'b mut Vec<u8>,
+        buf_start: usize
+    ) -> Result<Event<'b>> {
         match read_until(&mut self.reader, b'<', buf, &mut self.buf_position) {
-            Ok(0) => Ok(Event::Eof),
+            Ok(None) => Ok(Event::Eof),
             Ok(_) => {
+                self.last_tag_state = TagState::OpeningTagEncountered {
+                    offset: buf.len(),
+                    reading_state: State::Elem,
+                };
                 let (start, len) = (
                     buf_start
                         + if self.trim_text_start {
                             match buf.iter().skip(buf_start).position(|&b| !is_whitespace(b)) {
                                 Some(start) => start,
+
+                                // Here there is no text, just skip to the next event.
                                 None => return self.read_event(buf),
                             }
                         } else {
@@ -256,29 +288,46 @@ impl<B: BufRead> Reader<B> {
         }
     }
 
-    /// private function to read until '>' is found
-    fn read_until_close<'a, 'b>(&'a mut self, buf: &'b mut Vec<u8>) -> Result<Event<'b>> {
-        self.tag_state = TagState::Closed;
-
-        // need to read 1 character to decide whether pay special attention to attribute values
-        let buf_start = buf.len();
-        let start = loop {
-            match self.reader.fill_buf() {
-                Ok(n) if n.is_empty() => return Ok(Event::Eof),
-                Ok(n) => {
-                    // We intentionally don't `consume()` the byte, otherwise we would have to
-                    // handle things like '<>' here already.
-                    break n[0];
+    /// Private function which will read until encountering the first '>' and
+    /// emit an event if a new tag has been read.
+    fn read_until_closing_tag<'a, 'b>(
+        &'a mut self,
+        buf: &'b mut Vec<u8>,
+        buf_start: usize,
+        reading_state: State
+    ) -> Result<Event<'b>> {
+        let start = if buf.len() <= buf_start {
+            loop {
+                match self.reader.fill_buf() {
+                    Ok(n) if n.is_empty() => return Ok(Event::Eof),
+                    Ok(n) => {
+                        // We intentionally don't `consume()` the byte, otherwise we would have to
+                        // handle things like '<>' here already.
+                        break n[0];
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(Error::Io(e)),
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(Error::Io(e)),
             }
+        } else {
+            buf[buf_start]
         };
 
         if start != b'/' && start != b'!' && start != b'?' {
-            match read_elem_until(&mut self.reader, b'>', buf, &mut self.buf_position) {
-                Ok(0) => Ok(Event::Eof),
+            match read_elem_until(&mut self.reader, b'>', buf, &mut self.buf_position, reading_state) {
+                // ">" not found. Returns Eof until more data is sent.
+                Ok((None, state)) => {
+                    self.last_tag_state = TagState::OpeningTagEncountered {
+                        offset: buf_start,
+                        reading_state: state,
+                    };
+                    Ok(Event::Eof)
+                }
                 Ok(_) => {
+                    self.last_tag_state = TagState::ClosingTagEncountered {
+                        offset: buf.len()
+                    };
+
                     // we already *know* that we are in this case
                     self.read_start(&buf[buf_start..])
                 }
@@ -286,11 +335,46 @@ impl<B: BufRead> Reader<B> {
             }
         } else {
             match read_until(&mut self.reader, b'>', buf, &mut self.buf_position) {
-                Ok(0) => Ok(Event::Eof),
+                // ">" not found. Returns Eof until more data is sent.
+                Ok(None) => Ok(Event::Eof),
                 Ok(_) => match start {
-                    b'/' => self.read_end(&buf[buf_start..]),
-                    b'!' => self.read_bang(buf_start, buf),
-                    b'?' => self.read_question_mark(&buf[buf_start..]),
+                    b'/' => {
+                        self.last_tag_state = TagState::ClosingTagEncountered {
+                            offset: buf.len()
+                        };
+                        self.read_end(&buf[buf_start..])
+                    },
+                    b'!' => {
+                        if buf[buf_start..].starts_with(b"!--") {
+                            self.last_tag_state = TagState::InsideComment {
+                                offset: buf_start
+                            };
+                            self.read_comment(buf, buf_start)
+                        } else if buf.len() >= buf_start + 8 {
+                            match &buf[buf_start + 1..buf_start + 8] {
+                                b"[CDATA[" => {
+                                    self.last_tag_state = TagState::InsideCdata {
+                                        offset: buf_start
+                                    };
+                                    self.read_c_data(buf, buf_start)
+                                }
+                                x if x.eq_ignore_ascii_case(b"DOCTYPE") => {
+                                    self.last_tag_state = TagState::InsideDocType {
+                                        offset: buf_start
+                                    };
+                                    self.read_doc_type(buf, buf_start)
+                                }
+                                _ => Err(Error::UnexpectedBang),
+                            }
+                        } else {
+                            self.buf_position -= buf.len() - buf_start;
+                            Err(Error::UnexpectedBang)
+                        }
+                    },
+                    b'?' => {
+                        self.last_tag_state = TagState::ClosingTagEncountered { offset: buf.len() };
+                        self.read_question_mark(&buf[buf_start..])
+                    },
                     _ => unreachable!(
                         "We checked that `start` must be one of [/!?], was {:?} \
                              instead.",
@@ -343,86 +427,84 @@ impl<B: BufRead> Reader<B> {
         }
     }
 
-    /// reads `BytesElement` starting with a `!`,
-    /// return `Comment`, `CData` or `DocType` event
-    ///
-    /// Note: depending on the start of the Event, we may need to read more
-    /// data, thus we need a mutable buffer
-    fn read_bang<'a, 'b>(
+    fn read_comment<'a, 'b>(
         &'a mut self,
-        buf_start: usize,
         buf: &'b mut Vec<u8>,
+        buf_start: usize,
     ) -> Result<Event<'b>> {
-        if buf[buf_start..].starts_with(b"!--") {
-            while buf.len() < buf_start + 5 || !buf.ends_with(b"--") {
-                buf.push(b'>');
-                match read_until(&mut self.reader, b'>', buf, &mut self.buf_position) {
-                    Ok(0) => {
-                        self.buf_position -= buf.len() - buf_start;
-                        return Err(Error::UnexpectedEof("Comment".to_string()));
-                    }
-                    Ok(_) => (),
-                    Err(e) => return Err(e),
+        while buf.len() < buf_start + 5 || !buf.ends_with(b"--") {
+            buf.push(b'>');
+
+            match read_until(&mut self.reader, b'>', buf, &mut self.buf_position) {
+                Ok(None) => {
+                    return Ok(Event::Eof);
                 }
+                Ok(_) => (),
+                Err(e) => return Err(e),
             }
-            let len = buf.len();
-            if self.check_comments {
-                // search if '--' not in comments
-                if let Some(p) = memchr::memchr_iter(b'-', &buf[buf_start + 3..len - 2])
-                    .position(|p| buf[buf_start + 3 + p + 1] == b'-')
-                {
-                    self.buf_position -= buf.len() - buf_start + p;
-                    return Err(Error::UnexpectedToken("--".to_string()));
-                }
-            }
-            Ok(Event::Comment(BytesText::from_escaped(
-                &buf[buf_start + 3..len - 2],
-            )))
-        } else if buf.len() >= buf_start + 8 {
-            match &buf[buf_start + 1..buf_start + 8] {
-                b"[CDATA[" => {
-                    while buf.len() < 10 || !buf.ends_with(b"]]") {
-                        buf.push(b'>');
-                        match read_until(&mut self.reader, b'>', buf, &mut self.buf_position) {
-                            Ok(0) => {
-                                self.buf_position -= buf.len() - buf_start;
-                                return Err(Error::UnexpectedEof("CData".to_string()));
-                            }
-                            Ok(_) => (),
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    Ok(Event::CData(BytesText::from_plain(
-                        &buf[buf_start + 8..buf.len() - 2],
-                    )))
-                }
-                x if x.eq_ignore_ascii_case(b"DOCTYPE") => {
-                    let mut count = buf.iter().skip(buf_start).filter(|&&b| b == b'<').count();
-                    while count > 0 {
-                        buf.push(b'>');
-                        match read_until(&mut self.reader, b'>', buf, &mut self.buf_position) {
-                            Ok(0) => {
-                                self.buf_position -= buf.len() - buf_start;
-                                return Err(Error::UnexpectedEof("DOCTYPE".to_string()));
-                            }
-                            Ok(n) => {
-                                let start = buf.len() - n;
-                                count += buf.iter().skip(start).filter(|&&b| b == b'<').count();
-                                count -= 1;
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    Ok(Event::DocType(BytesText::from_escaped(
-                        &buf[buf_start + 8..buf.len()],
-                    )))
-                }
-                _ => Err(Error::UnexpectedBang),
-            }
-        } else {
-            self.buf_position -= buf.len() - buf_start;
-            Err(Error::UnexpectedBang)
         }
+
+        let len = buf.len();
+        self.last_tag_state = TagState::ClosingTagEncountered { offset: len };
+        if self.check_comments {
+            // search if '--' not in comments
+            if let Some(p) = memchr::memchr_iter(b'-', &buf[buf_start + 3..len - 2])
+                .position(|p| buf[buf_start + 3 + p + 1] == b'-')
+            {
+                self.buf_position -= buf.len() - buf_start + p;
+                return Err(Error::UnexpectedToken("--".to_string()));
+            }
+        }
+        Ok(Event::Comment(BytesText::from_escaped(
+            &buf[buf_start + 3..len - 2],
+        )))
+    }
+
+    fn read_c_data<'a, 'b>(
+        &'a mut self,
+        buf: &'b mut Vec<u8>,
+        buf_start: usize,
+    ) -> Result<Event<'b>> {
+        while buf.len() < 10 || !buf.ends_with(b"]]") {
+            buf.push(b'>');
+            match read_until(&mut self.reader, b'>', buf, &mut self.buf_position) {
+                Ok(None) => {
+                    return Ok(Event::Eof);
+                }
+                Ok(_) => (),
+                Err(e) => return Err(e),
+            }
+        }
+        self.last_tag_state = TagState::ClosingTagEncountered { offset: buf.len() };
+        Ok(Event::CData(BytesText::from_plain(
+                    &buf[buf_start + 8..buf.len() - 2],
+        )))
+    }
+
+    fn read_doc_type<'a, 'b>(
+        &'a mut self,
+        buf: &'b mut Vec<u8>,
+        buf_start: usize,
+    ) -> Result<Event<'b>> {
+        let mut count = buf.iter().skip(buf_start).filter(|&&b| b == b'<').count();
+        while count > 0 {
+            buf.push(b'>');
+            match read_until(&mut self.reader, b'>', buf, &mut self.buf_position) {
+                Ok(None) => {
+                    return Ok(Event::Eof);
+                }
+                Ok(Some(n)) => {
+                    let start = buf.len() - n;
+                    count += buf.iter().skip(start).filter(|&&b| b == b'<').count();
+                    count -= 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.last_tag_state = TagState::ClosingTagEncountered { offset: buf.len() };
+        Ok(Event::DocType(BytesText::from_escaped(
+                    &buf[buf_start + 8..buf.len()],
+        )))
     }
 
     /// reads `BytesElement` starting with a `?`,
@@ -466,15 +548,6 @@ impl<B: BufRead> Reader<B> {
         }
     }
 
-    #[inline]
-    fn close_expanded_empty(&mut self) -> Result<Event<'static>> {
-        self.tag_state = TagState::Closed;
-        let name = self
-            .opened_buffer
-            .split_off(self.opened_starts.pop().unwrap());
-        Ok(Event::End(BytesEnd::owned(name)))
-    }
-
     /// reads `BytesElement` starting with any character except `/`, `!` or ``?`
     /// return `Start` or `Empty` event
     fn read_start<'a, 'b>(&'a mut self, buf: &'b [u8]) -> Result<Event<'b>> {
@@ -484,7 +557,7 @@ impl<B: BufRead> Reader<B> {
         if let Some(&b'/') = buf.last() {
             let end = if name_end < len { name_end } else { len - 1 };
             if self.expand_empty_elements {
-                self.tag_state = TagState::Empty;
+                self.last_tag_state = TagState::Empty;
                 self.opened_starts.push(self.opened_buffer.len());
                 self.opened_buffer.extend(&buf[..end]);
                 Ok(Event::Start(BytesStart::borrowed(&buf[..len - 1], end)))
@@ -538,23 +611,173 @@ impl<B: BufRead> Reader<B> {
     ///         Ok(Event::Eof) => break,
     ///         _ => (),
     ///     }
-    ///     buf.clear();
+    ///     reader.try_clear_buffer(&mut buf);
     /// }
     /// println!("Found {} start events", count);
     /// println!("Text events: {:?}", txt);
     /// ```
     pub fn read_event<'a, 'b>(&'a mut self, buf: &'b mut Vec<u8>) -> Result<Event<'b>> {
-        let event = match self.tag_state {
-            TagState::Opened => self.read_until_close(buf),
-            TagState::Closed => self.read_until_open(buf),
-            TagState::Empty => self.close_expanded_empty(),
+        let event = match self.last_tag_state {
+            TagState::Beginning => self.read_until_opening_tag(buf, 0),
+            TagState::ClosingTagEncountered { offset } =>
+                self.read_until_opening_tag(buf, offset),
+            TagState::OpeningTagEncountered { offset, reading_state } =>
+                self.read_until_closing_tag(buf, offset, reading_state),
+            TagState::InsideComment { offset } => self.read_comment(buf, offset),
+            TagState::InsideCdata { offset } => self.read_c_data(buf, offset),
+            TagState::InsideDocType { offset } => self.read_doc_type(buf, offset),
+            TagState::Empty => {
+                self.last_tag_state = TagState::ClosingTagEncountered {
+                    offset: buf.len()
+                };
+                let name = self
+                    .opened_buffer
+                    .split_off(self.opened_starts.pop().unwrap());
+                Ok(Event::End(BytesEnd::owned(name)))
+            },
             TagState::Exit => return Ok(Event::Eof),
         };
         match event {
-            Err(_) | Ok(Event::Eof) => self.tag_state = TagState::Exit,
+            Err(_) => self.last_tag_state = TagState::Exit,
             _ => {}
         }
         event
+    }
+
+    /// Read and emit potential remaining text present after the last element.
+    /// To call only after `read_event` browsed through the full XML data.
+    ///
+    /// The `read_event` function does not emit any event for the potential text (and most
+    /// likely, whitespace) that comes after the last closing tag.
+    ///
+    /// If you're sure that the whole XML is now available to this parser and if you've
+    /// reached Eof when calling `read_event`, you can still be notified of the remaining
+    /// text through a Text event thanks to this method.
+    ///
+    /// ```
+    /// use quick_xml::Reader;
+    /// use quick_xml::events::{Event, BytesText};
+    ///
+    /// // Note the four spaces after the last closing tag `</tag1>`
+    /// let xml = r#"<tag1 att1 = "test">
+    ///                 <tag2><!--Test comment-->Test</tag2>
+    ///                 <tag2>Test 2</tag2>
+    ///             </tag1>    "#;
+    /// let mut reader = Reader::from_str(xml);
+    /// reader.trim_text(false);
+    /// let mut buf = Vec::new();
+    /// loop {
+    ///     match reader.read_event(&mut buf) {
+    ///         Ok(Event::Eof) => break,
+    ///         _ => (),
+    ///     }
+    ///     reader.try_clear_buffer(&mut buf);
+    /// }
+    /// match reader.read_remaining_text(&mut buf).unwrap() {
+    ///   Event::Text(content) => {
+    ///     assert_eq!(&*content, b"    ");
+    ///   },
+    ///   _ => { panic!("Unexpected event"); },
+    /// };
+    /// ```
+    pub fn read_remaining_text<'a, 'b>(&'a mut self, buf: &'b mut Vec<u8>) -> Result<Event<'b>> {
+        match self.last_tag_state {
+            TagState::ClosingTagEncountered { offset } =>
+                self.read_until_end(buf, offset),
+            TagState::Exit => Ok(Event::Eof),
+            _ =>  Err(Error::TextNotFound),
+        }
+    }
+
+    fn read_until_end<'a, 'b>(
+        &'a mut self,
+        buf: &'b mut Vec<u8>,
+        buf_start: usize
+    ) -> Result<Event<'b>> {
+        let (start, len) = (
+            buf_start
+            + if self.trim_text_start {
+                match buf.iter().skip(buf_start).position(|&b| !is_whitespace(b)) {
+                    Some(start) => start,
+                    None => 0,
+                }
+            } else {
+                0
+            },
+            if self.trim_text_end {
+                buf.iter()
+                    .rposition(|&b| !is_whitespace(b))
+                    .map_or_else(|| buf.len(), |p| p + 1)
+            } else {
+                buf.len()
+            },
+        );
+        if len > start {
+            Ok(Event::Text(BytesText::from_escaped(&buf[start..len])))
+        } else {
+            Ok(Event::Eof)
+        }
+    }
+
+    /// Try clearing the associated buffer
+    /// Returns `true` if the buffer could have been cleared
+    pub fn try_clear_buffer<'a, 'b>(&'a mut self, buf: &'b mut Vec<u8>) -> bool {
+        match self.last_tag_state {
+            TagState::Beginning |
+                TagState::Empty |
+                TagState::Exit => {
+                    buf.clear();
+                    true
+                }
+            TagState::ClosingTagEncountered { offset } => {
+                if offset == buf.len() {
+                    buf.clear();
+                    self.last_tag_state = TagState::ClosingTagEncountered { offset: 0 };
+                    true
+                } else {
+                    false
+                }
+            },
+            TagState::OpeningTagEncountered { offset, reading_state } => {
+                if offset == buf.len() {
+                    buf.clear();
+                    self.last_tag_state = TagState::OpeningTagEncountered {
+                        offset: 0,
+                        reading_state,
+                    };
+                    true
+                } else {
+                    false
+                }
+            },
+            TagState::InsideComment { offset } => {
+                if offset == buf.len() {
+                    buf.clear();
+                    self.last_tag_state = TagState::InsideComment { offset: 0 };
+                    true
+                } else {
+                    false
+                }
+            },
+            TagState::InsideCdata { offset } => {
+                if offset == buf.len() {
+                    buf.clear();
+                    self.last_tag_state = TagState::InsideCdata { offset: 0 };
+                    true
+                } else {
+                    false
+                }
+            },
+            TagState::InsideDocType { offset } => {
+                if offset == buf.len() {
+                    buf.clear();
+                    self.last_tag_state = TagState::InsideDocType { offset: 0 };
+                    true
+                } else {
+                    false
+                }
+            },
+        }
     }
 
     /// Resolves a potentially qualified **event name** into (namespace name, local name).
@@ -798,7 +1021,7 @@ impl<B: BufRead> Reader<B> {
                 }
                 _ => (),
             }
-            buf.clear();
+            self.try_clear_buffer(buf);
         }
     }
 
@@ -814,24 +1037,26 @@ impl<B: BufRead> Reader<B> {
     /// # Examples
     ///
     /// ```
-    /// use quick_xml::Reader;
-    /// use quick_xml::events::Event;
-    ///
-    /// let mut xml = Reader::from_reader(b"
-    ///     <a>&lt;b&gt;</a>
-    ///     <a></a>
-    /// " as &[u8]);
-    /// xml.trim_text(true);
-    ///
-    /// let expected = ["<b>", ""];
-    /// for &content in expected.iter() {
-    ///     match xml.read_event(&mut Vec::new()) {
-    ///         Ok(Event::Start(ref e)) => {
-    ///             assert_eq!(&xml.read_text(e.name(), &mut Vec::new()).unwrap(), content);
-    ///         },
-    ///         e => panic!("Expecting Start event, found {:?}", e),
-    ///     }
-    /// }
+    ///   // XXX TODO
+    ///   // use quick_xml::Reader;
+    ///   // use quick_xml::events::Event;
+    ///   //
+    ///   // let mut buf = Vec::new();
+    ///   // let mut xml = Reader::from_reader(b"
+    ///   //     <a>&lt;b&gt;</a>
+    ///   //     <a></a>
+    ///   // " as &[u8]);
+    ///   // xml.trim_text(true);
+    ///   //
+    ///   // let expected = ["<b>", ""];
+    ///   // for &content in expected.iter() {
+    ///   //     match xml.read_event(&mut buf) {
+    ///   //         Ok(Event::Start(ref e)) => {
+    ///   //             assert_eq!(&xml.read_text(e.name(), &mut buf).unwrap(), content);
+    ///   //         },
+    ///   //         e => panic!("Expecting Start event, found {:?}", e),
+    ///   //     }
+    ///   // }
     /// ```
     ///
     /// [`Text`]: events/enum.Event.html#variant.Text
@@ -897,7 +1122,7 @@ impl<B: BufRead> Reader<B> {
     ///         Ok(Event::Eof) => unreachable!(),
     ///         _ => (),
     ///     }
-    ///     buf.clear();
+    ///     reader.try_clear_buffer(&mut buf);
     /// }
     /// ```
     pub fn into_underlying_reader(self) -> B {
@@ -921,21 +1146,27 @@ impl<'a> Reader<&'a [u8]> {
     }
 }
 
-/// read until `byte` is found or end of file
-/// return the position of byte
+/// read until `byte` is found and returns the amount of bytes read until
+/// it has been found.
+///
+/// Returns Ok(None) if EOF has been reached without finding anything.
 #[inline]
 fn read_until<R: BufRead>(
     r: &mut R,
     byte: u8,
     buf: &mut Vec<u8>,
     position: &mut usize,
-) -> Result<usize> {
+) -> Result<Option<usize>> {
     let mut read = 0;
     let mut done = false;
     while !done {
         let used = {
             let available = match r.fill_buf() {
-                Ok(n) if n.is_empty() => break,
+                Ok(n) if n.is_empty() => {
+                    *position += read;
+                    println!("POS: {}", position);
+                    return Ok(None);
+                },
                 Ok(n) => n,
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => {
@@ -960,7 +1191,17 @@ fn read_until<R: BufRead>(
         read += used;
     }
     *position += read;
-    Ok(read)
+    Ok(Some(read))
+}
+
+#[derive(Clone, Copy)]
+enum State {
+    /// The initial state (inside element, but outside of attribute value)
+    Elem,
+    /// Inside a single-quoted attribute value
+    SingleQ,
+    /// Inside a double-quoted attribute value
+    DoubleQ,
 }
 
 /// Derived from `read_until`, but modified to handle XML attributes using a minimal state machine.
@@ -979,23 +1220,18 @@ fn read_elem_until<R: BufRead>(
     end_byte: u8,
     buf: &mut Vec<u8>,
     position: &mut usize,
-) -> Result<usize> {
-    #[derive(Clone, Copy)]
-    enum State {
-        /// The initial state (inside element, but outside of attribute value)
-        Elem,
-        /// Inside a single-quoted attribute value
-        SingleQ,
-        /// Inside a double-quoted attribute value
-        DoubleQ,
-    }
-    let mut state = State::Elem;
+    initial_state: State
+) -> Result<(Option<usize>, State)> {
+    let mut state = initial_state;
     let mut read = 0;
     let mut done = false;
     while !done {
         let used = {
             let available = match r.fill_buf() {
-                Ok(n) if n.is_empty() => return Ok(read),
+                Ok(n) if n.is_empty() => {
+                    *position += read;
+                    return Ok((None, state));
+                },
                 Ok(n) => n,
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => {
@@ -1040,7 +1276,7 @@ fn read_elem_until<R: BufRead>(
         read += used;
     }
     *position += read;
-    Ok(read)
+    Ok((Some(read), state))
 }
 
 /// A function to check whether the byte is a whitespace (blank, new line, carriage return or tab)

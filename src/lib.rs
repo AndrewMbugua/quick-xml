@@ -51,7 +51,7 @@
 //!     }
 //!
 //!     // if we don't keep a borrow elsewhere, we can clear the buffer to keep memory usage low
-//!     buf.clear();
+//!     reader.try_clear_buffer(&mut buf);
 //! }
 //! ```
 //!
@@ -95,7 +95,7 @@
 //!         // Ok(e) => assert!(writer.write(&buf).is_ok()),
 //!         Err(e) => panic!("Error at position {}: {:?}", reader.buffer_position(), e),
 //!     }
-//!     buf.clear();
+//!     reader.try_clear_buffer(&mut buf);
 //! }
 //!
 //! let result = writer.into_inner().into_inner();
