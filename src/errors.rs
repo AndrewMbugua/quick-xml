@@ -33,7 +33,7 @@ pub enum Error {
     /// Duplicate attribute
     DuplicatedAttribute(usize, usize),
     /// Escape error
-    EscapeError(::escape::EscapeError),
+    EscapeError(crate::escape::EscapeError),
 }
 
 impl From<::std::io::Error> for Error {

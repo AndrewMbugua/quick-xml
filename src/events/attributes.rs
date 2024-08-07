@@ -2,9 +2,9 @@
 //!
 //! Provides an iterator over attributes key/value pairs
 
-use errors::{Error, Result};
-use escape::{do_unescape, escape};
-use reader::{is_whitespace, Reader};
+use crate::errors::{Error, Result};
+use crate::escape::{do_unescape, escape};
+use crate::reader::{is_whitespace, Reader};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -359,7 +359,7 @@ impl<'a> Iterator for Attributes<'a> {
                 return Some(Ok(Attribute {
                     key: &self.bytes[$key],
                     value: Cow::Borrowed(&self.bytes[$val]),
-                }));
+                }))
             };
         }
 
@@ -426,10 +426,10 @@ impl<'a> Iterator for Attributes<'a> {
                 match bytes.by_ref().find(|&(_, &b)| b == *quote) {
                     Some((j, _)) => {
                         self.position = j + 1;
-                        attr!(start_key..end_key, i + 1..j)
+                        attr!(start_key..end_key, i + 1..j);
                     }
                     None => err!(Error::UnquotedValue(i)),
-                }
+                };
             }
             Some((i, _)) if self.html => {
                 let j = bytes
@@ -441,7 +441,7 @@ impl<'a> Iterator for Attributes<'a> {
             }
             Some((i, _)) => err!(Error::UnquotedValue(i)),
             None => attr!(start_key..end_key),
-        }
+        };
     }
 }
 
